@@ -40,8 +40,7 @@ typedef struct {
     uint8_t* loss_ptr;
 } PulseObject;
 
-static int
-Pulse_init(PulseObject* self, PyObject* args, PyObject* kwds)
+static int Pulse_init(PulseObject* self, PyObject* args, PyObject* kwds)
 {
     static char* kwlist[] = {"capacity", NULL};
     Py_ssize_t cap = 0;
@@ -57,42 +56,47 @@ Pulse_init(PulseObject* self, PyObject* args, PyObject* kwds)
     self->capacity = cap;
     self->cursor = 0;
 
-    self->acc_arr = NULL;
-    self->loss_arr = NULL;
+    // Allocate 64-byte aligned memory for SIMD performance
+    size_t nbytes = (size_t)cap * sizeof(uint8_t);
+    void *acc_raw = NULL, *loss_raw = NULL;
 
-    self->acc_ptr = NULL;
-    self->loss_ptr = NULL;
-
-    npy_intp dims[1];
-    dims[0] = (npy_intp)cap;
-
-    self->acc_arr   = (PyObject*)PyArray_SimpleNew(1, dims, NPY_UINT8);
-    self->loss_arr  = (PyObject*)PyArray_SimpleNew(1, dims, NPY_UINT8);
-
-    if (!self->acc_arr || !self->loss_arr) {
-        Py_XDECREF(self->acc_arr);
-        Py_XDECREF(self->loss_arr);
-        self->acc_arr = self->loss_arr = NULL;
-        PyErr_SetString(PyExc_MemoryError, "failed to allocate numpy arrays");
+    if (posix_memalign(&acc_raw, 64, nbytes) != 0 ||
+        posix_memalign(&loss_raw, 64, nbytes) != 0) {
+        free(acc_raw); free(loss_raw);
+        PyErr_SetString(PyExc_MemoryError, "Failed to allocate aligned memory");
         return -1;
     }
 
-    self->acc_ptr   = (uint8_t*)PyArray_DATA((PyArrayObject*)self->acc_arr);
-    self->loss_ptr  = (uint8_t*)PyArray_DATA((PyArrayObject*)self->loss_arr);
+    npy_intp dims[1] = {(npy_intp)cap};
+
+    // Wrap aligned pointers into NumPy arrays
+    self->acc_arr  = PyArray_SimpleNewFromData(1, dims, NPY_UINT8, acc_raw);
+    self->loss_arr = PyArray_SimpleNewFromData(1, dims, NPY_UINT8, loss_raw);
+
+    if (!self->acc_arr || !self->loss_arr) {
+        free(acc_raw); free(loss_raw);
+        Py_XDECREF(self->acc_arr); Py_XDECREF(self->loss_arr);
+        return -1;
+    }
+
+    // Tell NumPy it owns the memory so it calls free() on dealloc
+    PyArray_ENABLEFLAGS((PyArrayObject*)self->acc_arr, NPY_ARRAY_OWNDATA);
+    PyArray_ENABLEFLAGS((PyArrayObject*)self->loss_arr, NPY_ARRAY_OWNDATA);
+
+    self->acc_ptr  = (uint8_t*)acc_raw;
+    self->loss_ptr = (uint8_t*)loss_raw;
 
     return 0;
 }
 
-static void
-Pulse_dealloc(PulseObject* self)
+static void Pulse_dealloc(PulseObject* self)
 {
     Py_XDECREF(self->acc_arr);
     Py_XDECREF(self->loss_arr);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
-static PULSE_INLINE PyObject*
-Pulse_append(PulseObject* self, PyObject* const* args, Py_ssize_t nargs)
+static PULSE_INLINE PyObject* Pulse_append(PulseObject* self, PyObject* const* args, Py_ssize_t nargs)
 {
     Py_ssize_t i = self->cursor;
     self->cursor++;
@@ -109,22 +113,23 @@ Pulse_append(PulseObject* self, PyObject* const* args, Py_ssize_t nargs)
     Py_RETURN_NONE;
 }
 
-static PyObject*
-Pulse_size(PulseObject* self, PyObject* Py_UNUSED(ignored))
+static PyObject* Pulse_size(PulseObject* self, PyObject* Py_UNUSED(ignored))
 {
     return PyLong_FromSsize_t(self->cursor);
 }
 
-static PyObject*
-Pulse_arrays(PulseObject* self, PyObject* Py_UNUSED(ignored))
+static PyObject* Pulse_arrays(PulseObject* self, PyObject* Py_UNUSED(ignored))
 {
+    // Ensure the arrays are writable before passing to Numba
+    PyArray_ENABLEFLAGS((PyArrayObject*)self->acc_arr, NPY_ARRAY_WRITEABLE);
+    PyArray_ENABLEFLAGS((PyArrayObject*)self->loss_arr, NPY_ARRAY_WRITEABLE);
+
     Py_INCREF(self->acc_arr);
     Py_INCREF(self->loss_arr);
     return PyTuple_Pack(2, self->acc_arr, self->loss_arr);
 }
 
-static PULSE_INLINE int
-pulse_write_all(int fd, const void* buf, size_t n)
+static PULSE_INLINE int pulse_write_all(int fd, const void* buf, size_t n)
 {
     const uint8_t* p = (const uint8_t*)buf;
     while (n) {
@@ -142,13 +147,18 @@ pulse_write_all(int fd, const void* buf, size_t n)
     return 0;
 }
 
-static PyObject*
-Pulse_flush(PulseObject* self, PyObject* args)
+static PyObject* Pulse_flush(PulseObject* self, PyObject* args)
 {
     const char* path = NULL;
-    if (!PyArg_ParseTuple(args, "s", &path)) {
+    Py_ssize_t n_to_write = -1;
+
+    // Optional second argument for n_records
+    if (!PyArg_ParseTuple(args, "s|n", &path, &n_to_write)) {
         return NULL;
     }
+
+    // Default to capacity if no size provided
+    size_t n = (n_to_write < 0) ? (size_t)self->capacity : (size_t)n_to_write;
 
     int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
     if (fd < 0) {
@@ -159,27 +169,16 @@ Pulse_flush(PulseObject* self, PyObject* args)
     PulseFileHeader h;
     h.magic = PULSE_MAGIC;
     h.version = PULSE_VERSION;
-    h.nrecords = (uint64_t)self->cursor;
+    h.nrecords = (uint64_t)n;
 
     int rc = 0;
-    int saved_errno = 0;
-
     Py_BEGIN_ALLOW_THREADS
-
     if (pulse_write_all(fd, &h, sizeof(h)) != 0) rc = -1;
-
-
-    if (rc == 0 && self->cursor > 0) {
-        size_t n = (size_t)self->cursor;
-
+    if (rc == 0 && n > 0) {
         if (pulse_write_all(fd, self->acc_ptr, n) != 0) rc = -1;
-        if (rc == 0 && pulse_write_all(fd, self->loss_ptr, n) != 0) rc = -1;
+        if (pulse_write_all(fd, self->loss_ptr, n) != 0) rc = -1;
     }
-
-    saved_errno = errno;
     close(fd);
-    errno = saved_errno;
-
     Py_END_ALLOW_THREADS
 
     if (rc != 0) {
@@ -190,11 +189,41 @@ Pulse_flush(PulseObject* self, PyObject* args)
     Py_RETURN_NONE;
 }
 
+// Add these to Pulse_methods
+static PyObject* Pulse_get_acc_ptr(PulseObject* self, PyObject* Py_UNUSED(ignored))
+{
+    return PyLong_FromUnsignedLongLong((unsigned long long)self->acc_ptr);
+}
+
+static PyObject* Pulse_get_loss_view(PulseObject* self, PyObject* Py_UNUSED(ignored))
+{
+    // Return the numpy arrays directly so Numba can "see" them
+    Py_INCREF(self->acc_arr);
+    return self->acc_arr;
+}
+
+static PyObject*
+Pulse_set_cursor(PulseObject* self, PyObject* args)
+{
+    Py_ssize_t new_cursor;
+    if (!PyArg_ParseTuple(args, "n", &new_cursor)) {
+        return NULL;
+    }
+    if (new_cursor < 0 || new_cursor > self->capacity) {
+        PyErr_SetString(PyExc_ValueError, "cursor out of bounds");
+        return NULL;
+    }
+    self->cursor = new_cursor;
+    Py_RETURN_NONE;
+}
+
+
 static PyMethodDef Pulse_methods[] = {
-    {"append", (PyCFunction)Pulse_append, METH_FASTCALL, "append(accuracy:float, loss:float) -> None"},
-    {"size",   (PyCFunction)Pulse_size,   METH_NOARGS,   "size() -> int"},
-    {"arrays", (PyCFunction)Pulse_arrays, METH_NOARGS,   "arrays() -> (acc_u8, loss_u8)"},
-    {"flush",  (PyCFunction)Pulse_flush,  METH_VARARGS,  "flush(path:str) -> None"},
+    {"append", (PyCFunction)Pulse_append, METH_FASTCALL, ""},
+    {"size",   (PyCFunction)Pulse_size,   METH_NOARGS,   ""},
+    {"arrays", (PyCFunction)Pulse_arrays, METH_NOARGS,   ""},
+    {"flush",  (PyCFunction)Pulse_flush,  METH_VARARGS,  ""},
+    {"set_cursor", (PyCFunction)Pulse_set_cursor, METH_VARARGS, "Set the internal cursor after bulk writes"},
     {NULL, NULL, 0, NULL}
 };
 

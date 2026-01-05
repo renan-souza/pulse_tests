@@ -10,35 +10,32 @@ def read_pulse_file(path: str) -> pd.DataFrame:
     with open(path, "rb") as f:
         header = f.read(HEADER_SIZE)
         magic, version, n = struct.unpack(HEADER_FMT, header)
+        
+        # Map the file starting after the header
+        mm = np.memmap(path, dtype=np.uint8, mode="r", offset=HEADER_SIZE)
+        
+        # Slicing based on the 'n' found in the header
+        acc_q = mm[0 : n]
+        loss_q = mm[n : 2 * n]
 
-        if magic != MAGIC:
-            raise ValueError("Not a pulse file")
-        if version != 1:
-            raise ValueError(f"Unsupported version {version}")
-
-        # Memory-map the rest of the file
-        mm = np.memmap(f, dtype=np.uint8, mode="r")
-
-        offset = HEADER_SIZE
-        acc_q = mm[offset : offset + n]
-        offset += n
-
-        # The remaining data is loss_q. No need to update offset after this.
-        loss_q = mm[offset : offset + n]
-
-        # Dequantize (vectorized, fast)
-        df = pd.DataFrame({
+        return pd.DataFrame({
             "accuracy": acc_q.astype(np.float32) / 10.0,
             "loss": loss_q.astype(np.float32) / 10.0,
         })
 
-        return df
-
 def main():
-    df = read_pulse_file("pulse_simple.bin")
-    print(df.head())
-    print(df.tail())
-    print("rows:", len(df))
+    fpath = "pulse_log.bin"
+    try:
+        df = read_pulse_file(fpath)
+        print("First 5 records:")
+        print(df.head())
+        print("\nLast 5 records:")
+        print(df.tail())
+        print(f"\nTotal rows: {len(df)}")
+    except FileNotFoundError:
+        print(f"Error: {fpath} not found. Run the simulation first.")
+    except Exception as e:
+        print(f"Error loading file: {e}")
 
 if __name__ == "__main__":
     main()
