@@ -45,9 +45,7 @@ static int Pulse_init(PulseObject* self, PyObject* args, PyObject* kwds)
     static char* kwlist[] = {"capacity", NULL};
     Py_ssize_t cap = 0;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "n", kwlist, &cap)) {
-        return -1;
-    }
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "n", kwlist, &cap)) return -1;
     if (cap <= 0) {
         PyErr_SetString(PyExc_ValueError, "capacity must be > 0");
         return -1;
@@ -56,38 +54,30 @@ static int Pulse_init(PulseObject* self, PyObject* args, PyObject* kwds)
     self->capacity = cap;
     self->cursor = 0;
 
-    // Allocate 64-byte aligned memory for SIMD performance
-    size_t nbytes = (size_t)cap * sizeof(uint8_t);
-    void *acc_raw = NULL, *loss_raw = NULL;
-
-    if (posix_memalign(&acc_raw, 64, nbytes) != 0 ||
-        posix_memalign(&loss_raw, 64, nbytes) != 0) {
-        free(acc_raw); free(loss_raw);
-        PyErr_SetString(PyExc_MemoryError, "Failed to allocate aligned memory");
-        return -1;
-    }
+    self->acc_arr = NULL;
+    self->loss_arr = NULL;
+    self->acc_ptr = NULL;
+    self->loss_ptr = NULL;
 
     npy_intp dims[1] = {(npy_intp)cap};
 
-    // Wrap aligned pointers into NumPy arrays
-    self->acc_arr  = PyArray_SimpleNewFromData(1, dims, NPY_UINT8, acc_raw);
-    self->loss_arr = PyArray_SimpleNewFromData(1, dims, NPY_UINT8, loss_raw);
+    self->acc_arr  = (PyObject*)PyArray_SimpleNew(1, dims, NPY_UINT8);
+    self->loss_arr = (PyObject*)PyArray_SimpleNew(1, dims, NPY_UINT8);
 
     if (!self->acc_arr || !self->loss_arr) {
-        free(acc_raw); free(loss_raw);
-        Py_XDECREF(self->acc_arr); Py_XDECREF(self->loss_arr);
+        Py_XDECREF(self->acc_arr);
+        Py_XDECREF(self->loss_arr);
+        self->acc_arr = self->loss_arr = NULL;
+        PyErr_SetString(PyExc_MemoryError, "failed to allocate numpy arrays");
         return -1;
     }
 
-    // Tell NumPy it owns the memory so it calls free() on dealloc
-    PyArray_ENABLEFLAGS((PyArrayObject*)self->acc_arr, NPY_ARRAY_OWNDATA);
-    PyArray_ENABLEFLAGS((PyArrayObject*)self->loss_arr, NPY_ARRAY_OWNDATA);
-
-    self->acc_ptr  = (uint8_t*)acc_raw;
-    self->loss_ptr = (uint8_t*)loss_raw;
+    self->acc_ptr  = (uint8_t*)PyArray_DATA((PyArrayObject*)self->acc_arr);
+    self->loss_ptr = (uint8_t*)PyArray_DATA((PyArrayObject*)self->loss_arr);
 
     return 0;
 }
+
 
 static void Pulse_dealloc(PulseObject* self)
 {
@@ -96,22 +86,6 @@ static void Pulse_dealloc(PulseObject* self)
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
-static PULSE_INLINE PyObject* Pulse_append(PulseObject* self, PyObject* const* args, Py_ssize_t nargs)
-{
-    Py_ssize_t i = self->cursor;
-    self->cursor++;
-
-    uint8_t* acc_ptr  = self->acc_ptr;
-    uint8_t* loss_ptr = self->loss_ptr;
-
-    double acc_d  = PyFloat_AS_DOUBLE(args[0]);
-    double loss_d = PyFloat_AS_DOUBLE(args[1]);
-
-    acc_ptr[i]  = (uint8_t)PULSE_QUANTIZE_10(acc_d);
-    loss_ptr[i] = (uint8_t)PULSE_QUANTIZE_10(loss_d);
-
-    Py_RETURN_NONE;
-}
 
 static PyObject* Pulse_size(PulseObject* self, PyObject* Py_UNUSED(ignored))
 {
@@ -157,8 +131,16 @@ static PyObject* Pulse_flush(PulseObject* self, PyObject* args)
         return NULL;
     }
 
-    // Default to capacity if no size provided
-    size_t n = (n_to_write < 0) ? (size_t)self->capacity : (size_t)n_to_write;
+    size_t n;
+    if (n_to_write < 0) {
+        Py_ssize_t c = self->cursor;
+        if (c < 0) c = 0;
+        if (c > self->capacity) c = self->capacity;
+        n = (size_t)c;
+    } else {
+        if (n_to_write > self->capacity) n_to_write = self->capacity;
+        n = (size_t)n_to_write;
+    }
 
     int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
     if (fd < 0) {
@@ -219,7 +201,6 @@ Pulse_set_cursor(PulseObject* self, PyObject* args)
 
 
 static PyMethodDef Pulse_methods[] = {
-    {"append", (PyCFunction)Pulse_append, METH_FASTCALL, ""},
     {"size",   (PyCFunction)Pulse_size,   METH_NOARGS,   ""},
     {"arrays", (PyCFunction)Pulse_arrays, METH_NOARGS,   ""},
     {"flush",  (PyCFunction)Pulse_flush,  METH_VARARGS,  ""},
