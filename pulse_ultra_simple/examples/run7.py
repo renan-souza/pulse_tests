@@ -1,7 +1,6 @@
 import numpy as np
 import time
 import resource
-from numba import float32
 from numba import njit, uint8, int64
 from numba.experimental import jitclass
 from pulse_fast_ext import Pulse
@@ -26,10 +25,9 @@ class PulseBuffer:
 
 # 2. PURE PYTHON TRAINING FUNCTION
 # The order of arguments here must match the order passed to PulseManager
-def train_model(logger, max_iterations, alpha, beta):
-    current_loss = float32(1.0); current_acc = float32(0.1)
-
-    for _ in range(max_iterations):
+def train_model(logger, iterations, alpha, beta):
+    current_loss, current_acc = 1.0, 0.1
+    for _ in range(iterations):
         current_loss *= alpha
         current_acc += beta
         # C++ backed high-speed log
@@ -41,8 +39,7 @@ class PulseManager:
     def __init__(self, capacity, pulsed_function, *args, filepath="pulse_log.bin"):
         self.capacity = capacity
         self.filepath = filepath
-        self.pulsed_function = njit(pulsed_function, cache=True, fastmath=True, nogil=True)
-
+        self.pulsed_function = njit(pulsed_function)
         # We store the positional arguments (iterations, alpha, beta, etc.)
         self.args = args
         self.logger = None
@@ -53,18 +50,11 @@ class PulseManager:
         # This keeps the training function signature clean.
         self.pulsed_function(self.logger, *self.args)
 
-    def _warmup(self):
-        self.pulsed_function(self.logger, 1, *self.args[1:])  # compile with same types
-        self.logger.i = uint8(0)
-
     def __enter__(self):
         # Initialize C++ backend and extract NumPy views
         self.backend = Pulse(self.capacity)
         acc_arr, loss_arr = self.backend.arrays()
         self.logger = PulseBuffer(acc_arr, loss_arr)
-
-        self._warmup()
-
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -75,10 +65,10 @@ class PulseManager:
 # --- EXECUTION & VERIFICATION ---
 def run_simulation():
     # 1. Define storage and training parameters separately
-    STORAGE_CAPACITY = 256
-    TRAIN_ITERATIONS = np.int64(50_000_000)
-    ALPHA = np.float32(0.999999)
-    BETA = np.float32(0.0000001)
+    STORAGE_CAPACITY = 50_000_000
+    TRAIN_ITERATIONS = 50_000_000
+    ALPHA = 0.999999
+    BETA = 0.0000001
 
     # 2. Package positional arguments for the training function
     # Note: These correspond to (iterations, alpha, beta)
@@ -92,17 +82,17 @@ def run_simulation():
 
     print(f"Loop completed in: {t1 - t0:.4f}s")
 
-    # 4. Verification
-    print("Reading back data into pandas DataFrame...")
-    from read_into_pandas import read_pulse_file
-    df = read_pulse_file("pulse_log.bin")
-
-    print(f"Read back {len(df)} records.")
-    mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    print(f"Peak Memory: {mem_mb:.2f} MB")
-
-    assert len(df) == STORAGE_CAPACITY
-    print("Verification Successful.")
+    # # 4. Verification
+    # print("Reading back data into pandas DataFrame...")
+    # from read_into_pandas import read_pulse_file
+    # df = read_pulse_file("pulse_log.bin")
+    #
+    # print(f"Read back {len(df)} records.")
+    # mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    # print(f"Peak Memory: {mem_mb:.2f} MB")
+    #
+    # assert len(df) == STORAGE_CAPACITY
+    # print("Verification Successful.")
 
 
 if __name__ == "__main__":

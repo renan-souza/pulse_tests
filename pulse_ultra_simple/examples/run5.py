@@ -1,48 +1,44 @@
 import numpy as np
 import time
-import resource
 from numba import njit
 from pulse_fast_ext import Pulse
 
+# This function is inlined by Numba, so there is ZERO call overhead
+@njit(inline='always')
+def log(acc_view, loss_view, i, acc, loss):
+    acc_view[i] = np.uint8(acc * 10.0 + 0.5)
+    loss_view[i] = np.uint8(loss * 10.0 + 0.5)
+
 @njit
-def fast_loop(acc_view, loss_view, iterations):
+def main_loop(acc_view, loss_view, iterations):
     current_loss = 1.0
     current_acc = 0.1
     
     for i in range(iterations):
-        # Simulation Logic
         current_loss *= 0.999999
         current_acc += 0.0000001
         
-        # QUANTIZATION: Numba compiles this to a single CPU instruction
-        # Writing directly to the C-allocated memory
-        acc_view[i] = np.uint8(current_acc * 10.0 + 0.5)
-        loss_view[i] = np.uint8(current_loss * 10.0 + 0.5)
+        # SINGLE CALL: Complexity is hidden, performance is preserved
+        log(acc_view, loss_view, i, current_acc, current_loss)
 
 def run_simulation():
     MAX_EPOCHS = 50_000_000
     logger = Pulse(MAX_EPOCHS)
     
-    # Get direct NumPy views of the C-allocated memory
+    # Extract the raw memory views once
     acc_view, loss_view = logger.arrays()
 
     t0 = time.time()
-    t0_cpu = time.process_time()
-    
-    # Run the machine-code loop
-    fast_loop(acc_view, loss_view, MAX_EPOCHS)
-    
+    # Pass views into the compiled loop
+    main_loop(acc_view, loss_view, MAX_EPOCHS)
     t1 = time.time()
-    t1_cpu = time.process_time()
 
-    # Reporting
-    mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    print(f"Memory Usage: {mem_mb:.2f} MB")     
-    print(f"Loop completed in: {t1 - t0:.4f}s (CPU: {t1_cpu - t0_cpu:.4f}s)")
+    print(f"Loop completed in: {t1 - t0:.4f}s")
+    
     
     fpath = "pulse_log.bin"
     # Flush using the C-extension logic
-    logger.flush(fpath)
+    logger.flush(fpath, MAX_EPOCHS)
     print("Data flushed to binary.")
     
     # print(f"Records: {logger.size()}")  
