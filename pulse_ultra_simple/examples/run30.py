@@ -3,25 +3,21 @@ from numba import njit
 from time import time
 
 @njit(cache=True, fastmath=True, boundscheck=False, inline="always")
-def pulse(i, alpha, beta, args):
-    mask = args[0]
-    arr0 = args[1]
-    arr1 = args[2]
-    ix = i & mask
-    arr0[ix] = alpha
-    arr1[ix] = beta
+def pulse(i, acc, loss, args):
+    ix = i & args[0]
+    args[1][ix] = acc
+    args[2][ix] = loss
 
 def train_model(iterations, alpha, beta, *args):
-    curr_loss = 1.0
     curr_acc = 0.1
+    curr_loss = 1.0
 
     for i in range(iterations):
-        curr_loss *= alpha
-        curr_acc += beta
+        curr_acc += alpha
+        curr_loss *= beta
         pulse(i, curr_acc, curr_loss, args)
 
     return True
-
 
 class PulseManager:
     @staticmethod
@@ -46,8 +42,8 @@ class PulseManager:
 def main():
     capacity = 256
     iters = 1_000_000_000
-    alpha = 0.9999
-    beta = 0.0001
+    alpha = 0.0001
+    beta = 0.9999
     elapsed = PulseManager.run(train_model, capacity, iters, alpha, beta)
     print(f"{elapsed:.8f}s.")
 
