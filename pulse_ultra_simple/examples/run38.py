@@ -1,65 +1,68 @@
 import numpy as np
 from numba import njit
-from numba import int64, float64
 from time import perf_counter
-from math import sin, sqrt
+
 
 @njit(inline="always", fastmath=True, boundscheck=False)
 def pulse(i, acc, loss, args):
-    if (i & args[1]) != 0: # Sparse logging
+    if (i & args[1]) != 0:
         return
     ix = i & args[0]
     args[2][ix] = acc
     args[3][ix] = loss
 
+
 def train_model(iterations, x, alpha, beta, *args):
-    curr_acc = float64(0.1)
-    curr_loss = float64(1.0)
+    curr_acc = np.float32(0.1)
+    curr_loss = np.float32(1.0)
 
-    # loop-carried state
-    rng = int64(0x9E3779B97F4A7C15)
-    h = int64(0xCBF29CE484222325)
+    rng = np.int64(0x9E3779B97F4A7C15)
+    h = np.int64(0xCBF29CE484222325)
 
-    n = int64(x.shape[0])
-    mask = n - 1  # assumes n is power-of-two for speed; if not, use % n
+    n = np.int64(x.shape[0])
+    mask = n - np.int64(1)
 
-    iters = int64(iterations)
-    for i in range(iters):
-        # cheap PRNG (loop-carried)
-        rng = (rng * int64(6364136223846793005) + int64(1442695040888963407)) & int64(0xFFFFFFFFFFFFFFFF)
+    c_half = np.float32(0.5)
+    c_1e3 = np.float32(1e-3)
+    c_1e6 = np.float32(1e6)
+    c_1e6_u = np.float32(1e-6)
 
-        # data-dependent runtime load (prevents closed-form collapse)
-        j = (i + rng) & mask
-        u = float64(x[j])  # x is runtime data
+    mul = np.int64(6364136223846793005)
+    inc = np.int64(1442695040888963407)
+    modmask = np.int64(0xFFFFFFFFFFFFFFFF)
+    fnv = np.int64(0x100000001B3)
 
-        # "training-like" update with nonlinearity + data dependence
-        grad = (u - 0.5) + (curr_acc * 1e-3)
+    for i in range(iterations):
+        rng = (rng * mul + inc) & modmask
+
+        j = (np.int64(i) + rng) & mask
+        u = np.float32(x[j])
+
+        grad = (u - c_half) + (curr_acc * c_1e3)
         curr_acc = curr_acc + alpha * grad
-        curr_loss = (curr_loss * beta) + grad * grad + u * 1e-6
+        curr_loss = (curr_loss * beta) + grad * grad + u * c_1e6_u
 
-        # integer hash depends on evolving floats (forces loop execution)
-        q = int64(curr_acc * 1e6) ^ (int64(curr_loss * 1e6) << int64(1))
-        h = (h ^ q) * int64(0x100000001B3)  # FNV-ish
+        q = np.int64(curr_acc * c_1e6) ^ (np.int64(curr_loss * c_1e6) << np.int64(1))
+        h = (h ^ q) * fnv
 
         pulse(i, curr_acc, curr_loss, args)
 
     return h
 
 
-
 class PulseManager:
     @staticmethod
     def run(user_fn, capacity, *args, filepath="pulse_log.bin"):
-        mask = int64(capacity - 1)
-        sparse_mask = int64((2**10) - 1)
+        mask = np.int64(capacity - 1)
+        sparse_mask = np.int64((2**10) - 1)
 
         arr0 = np.empty(capacity, dtype=np.float32)
         arr1 = np.empty(capacity, dtype=np.float32)
 
         fast_user_fn = njit(user_fn, cache=True, fastmath=True, boundscheck=False)
 
-        # Warm up: MUST match the timed-call signature exactly
-        fast_user_fn(1,       *args[1:], mask, sparse_mask, arr0, arr1)
+        fast_user_fn(1, *args[1:], mask, sparse_mask, arr0, arr1)
+
         t0 = perf_counter()
         fast_user_fn(args[0], *args[1:], mask, sparse_mask, arr0, arr1)
         t1 = perf_counter()
@@ -69,10 +72,11 @@ class PulseManager:
 
 def main():
     capacity = 256
-    iters = 100_000_000
-    alpha = 0.0001
-    beta = 0.9999
-    x = np.random.random(1 << 20).astype(np.float64)  # power-of-two length
+    iters = np.int64(100_000_000)
+    alpha = np.float32(0.0001)
+    beta = np.float32(0.9999)
+    x = np.random.random(1 << 20).astype(np.float32)
+
     elapsed = PulseManager.run(train_model, capacity, iters, x, alpha, beta)
     print(f"{elapsed:.8f}s.")
 
