@@ -83,7 +83,7 @@ def main():
     MAX_ITERS = int64(1_000_000_000)
     ALPHA = 0.999999
     BETA = 0.0000001
-    THRESHOLD = 1.28
+    THRESHOLD = 1.27
 
     print(f"Starting simulation: {MAX_ITERS:,} iterations...")
 
