@@ -27,3 +27,7 @@ run:
 clean:
 	rm -rf build/ dist/ *.egg-info pulse_log.bin *.so *.dylib
 	find . -name "__pycache__" -exec rm -rf {} +
+
+docker:
+	docker run --rm -v "$$(pwd):/work/pulse_ultra_simple" -it pulse-ultra-simple:py312 /bin/bash
+

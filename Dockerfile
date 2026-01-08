@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /work
 
-RUN python -m pip install -U pip setuptools wheel pybind11 numpy pandas
+RUN python -m pip install -U pip setuptools wheel pybind11 numpy pandas numba
 
 COPY pulse_ultra_simple /work/pulse_ultra_simple
 WORKDIR /work/pulse_ultra_simple
