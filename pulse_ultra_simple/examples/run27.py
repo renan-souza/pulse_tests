@@ -12,14 +12,12 @@ nb.config.BOUNDSCHECK = 0
 # --------------------------------------------------------------------------------
 # FUNCTION FACTORY (Equivalent to C #DEFINE)
 # --------------------------------------------------------------------------------
-def create_log_fn(interval_mask, scale, bias):
+def create_log_fn(interval_mask):
     """
     Creates a specialized logging function where constants are baked into
     the machine code as immediates.
     """
     # Cast to specific types to aid the compiler
-    s = float32(scale)
-    b = float32(bias)
     m = int64(interval_mask)
 
     @njit(cache=True, fastmath=True, boundscheck=False, inline="always")
@@ -31,15 +29,15 @@ def create_log_fn(interval_mask, scale, bias):
         views = args[1]
         j = i & mask
         # s and b are hard-coded in the assembly, no memory lookup needed
-        views[0][j] = uint8(acc * s + b)
-        views[1][j] = uint8(loss * s + b)
+        views[0][j] = acc
+        views[1][j] = loss
 
     return log_impl
 
 
 # "Define" our constants here
 # Use (2^n - 1) for the interval to support bitwise logic (e.g., 7 = every 8th)
-log = create_log_fn(interval_mask=7, scale=10.0, bias=0.5)
+log = create_log_fn(interval_mask=7)
 
 
 # The user-facing code stays clean and standard
@@ -91,7 +89,7 @@ def main():
 
     elapsed = PulseManager.run(train_model, CAPACITY, MAX_ITERS, ALPHA, BETA)
 
-    print(f"Loop completed in: {elapsed:.4f} s.")
+    print(f"Loop completed in: {elapsed:.8f} s.")
 
     if elapsed >= THRESHOLD:
         raise Exception(f"Performance Regression: {elapsed:.4f}s exceeds {THRESHOLD}s limit.")
