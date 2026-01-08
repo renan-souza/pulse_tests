@@ -11,7 +11,6 @@ def pulse(i, alpha, beta, args):
     arr0[ix] = alpha
     arr1[ix] = beta
 
-#@njit(cache=True, fastmath=True, boundscheck=False)
 def train_model(iterations, alpha, beta, *args):
     curr_loss = 1.0
     curr_acc = 0.1
@@ -45,8 +44,8 @@ class PulseManager:
 
 
 def main():
-    capacity = 1 << 20
-    iters = 10_000_000
+    capacity = 256
+    iters = 1_000_000_000
     alpha = 0.9999
     beta = 0.0001
     elapsed = PulseManager.run(train_model, capacity, iters, alpha, beta)
