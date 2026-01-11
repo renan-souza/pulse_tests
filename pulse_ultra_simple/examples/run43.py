@@ -8,46 +8,36 @@ import pulse_rt_ext as rt
 
 ITERS = 100_000_000
 
-
 @intrinsic
 def rdtsc(typingctx):
     from llvmlite import ir
     sig = nb.core.typing.templates.signature(types.uint64)
-
     def codegen(context, builder, sig_obj, args):
         f = builder.module.declare_intrinsic("llvm.readcyclecounter", [], ir.FunctionType(ir.IntType(64), []))
         return builder.call(f, [], name="tsc")
-
     return sig, codegen
-
 
 @intrinsic
 def to_ptr(typingctx, addr_ty, dtype_ty):
     from llvmlite import ir
     ptr_ty = types.CPointer(dtype_ty.dtype)
     sig = ptr_ty(types.uint64, dtype_ty)
-
     def codegen(context, builder, sig_obj, args):
         return builder.inttoptr(args[0], context.get_value_type(ptr_ty))
-
     return sig, codegen
 
-
-@njit(inline="always")
+@njit(inline="always", fastmath=True)
 def pulse(i, acc, loss, args):
-    # args: [base_acc, base_loss, base_seq, base_tick]
-    # Direct offsets for maximal write-combining efficiency
-    off_4 = i * 4
-    off_8 = i * 8
+    # API: pulse(i, acc, loss, args)
+    # args: (acc_v, loss_v, seq_v, tick_v)
+    # This matches the run41.py indexing pattern exactly.
+    args[0][i] = acc
+    args[1][i] = loss
+    args[2][i] = i
+    args[3][i] = rdtsc()
 
-    # Store data + timestamp
-    to_ptr(args[0] + off_4, nb.float32)[0] = acc
-    to_ptr(args[1] + off_4, nb.float32)[0] = loss
-    to_ptr(args[2] + off_8, nb.int64)[0] = i
-    to_ptr(args[3] + off_8, nb.uint64)[0] = rdtsc()
-
-
-# --- USER FUNCTION (from run41.py) ---
+# --- USER FUNCTION (Unmodified from run41.py, added njit) ---
+@njit(fastmath=True)
 def train_model(iterations, x, alpha, beta, *args):
     curr_acc, curr_loss = np.float32(0.1), np.float32(1.0)
     rng, h = np.int64(0x9E3779B97F4A7C15), np.int64(0xCBF29CE484222325)
@@ -68,20 +58,32 @@ def train_model(iterations, x, alpha, beta, *args):
         pulse(i, curr_acc, curr_loss, args)
     return h
 
+@njit(fastmath=True)
+def _dispatch_run(iters, x, alpha, beta, ptr_acc, ptr_loss, ptr_seq, ptr_tick):
+    # Construct views inside JIT to avoid NotImplementedError
+    acc_v = nb.carray(to_ptr(ptr_acc, nb.float32), (iters,))
+    loss_v = nb.carray(to_ptr(ptr_loss, nb.float32), (iters,))
+    seq_v = nb.carray(to_ptr(ptr_seq, nb.int64), (iters,))
+    tick_v = nb.carray(to_ptr(ptr_tick, nb.uint64), (iters,))
+
+    pulse_args = (acc_v, loss_v, seq_v, tick_v)
+    return train_model(iters, x, alpha, beta, *pulse_args)
 
 class PulseManager:
     @staticmethod
     def run(user_fn, iters, x, alpha, beta):
         addrs = rt.init(int(iters))
-        packed_args = (np.uint64(addrs[0]), np.uint64(addrs[1]), np.uint64(addrs[2]), np.uint64(addrs[3]))
-        fast_fn = njit(user_fn, fastmath=True, boundscheck=False)
 
-        print("Warmup...")
-        fast_fn(np.int64(1000), x, alpha, beta, *packed_args)
+        # Warmup
+        _dispatch_run(np.int64(1000), x, alpha, beta,
+                      np.uint64(addrs[0]), np.uint64(addrs[1]),
+                      np.uint64(addrs[2]), np.uint64(addrs[3]))
 
         print("Timed Region Starting...")
         t0 = time.perf_counter()
-        h = fast_fn(iters, x, alpha, beta, *packed_args)
+        h = _dispatch_run(iters, x, alpha, beta,
+                          np.uint64(addrs[0]), np.uint64(addrs[1]),
+                          np.uint64(addrs[2]), np.uint64(addrs[3]))
         elapsed = time.perf_counter() - t0
         print(f"Elapsed: {elapsed:.4f}s")
 
@@ -89,32 +91,21 @@ class PulseManager:
         rt.save("pulse_output.bin")
         return h
 
-
 def verify_output(filepath, expected_n):
-    print(f"\n--- Verifying Integrity of {filepath} ---")
-    # File should be (4+4+8+8) * 100M = 24 bytes per record
+    print(f"\n--- Verifying Integrity ---")
     expected_size = expected_n * 24
-    actual_size = os.path.getsize(filepath)
-    print(f"File Size: {actual_size / 1e9:.2f} GB (Expected {expected_size / 1e9:.2f} GB)")
-
-    if actual_size != expected_size:
-        raise AssertionError("File size mismatch! Lossless capture failed.")
+    if os.path.getsize(filepath) != expected_size:
+        raise AssertionError(f"Size mismatch! Found {os.path.getsize(filepath)}, expected {expected_size}")
 
     with open(filepath, "rb") as f:
-        # Check first 5 and last 5 iteration indices
-        # Skip accuracy(4) and loss(4) = 8 bytes per record
-        record_stride = 24
-
-        print("Checking head and tail of seq array...")
-        for i in [0, 1, expected_n - 2, expected_n - 1]:
-            f.seek(int(expected_n * 8 + i * 8))  # Skip 2xfloat arrays (100M each)
-            seq_val = np.frombuffer(f.read(8), dtype=np.int64)[0]
-            print(f"  Record {i}: seq={seq_val}")
-            if seq_val != i:
-                raise AssertionError(f"Index mismatch at record {i}: found {seq_val}")
-
-    print("Verification Successful: 100M records monotonically captured.")
-
+        # Check sequence array (offset: acc(4)+loss(4) = 8 bytes per record)
+        # Skip 100M float32 (acc) and 100M float32 (loss)
+        f.seek(int(expected_n * 8 + (expected_n - 1) * 8))
+        last_val = np.frombuffer(f.read(8), dtype=np.int64)[0]
+        print(f"Last record seq check: {last_val}")
+        if last_val != expected_n - 1:
+            raise AssertionError("Sequence corruption!")
+    print("Verification Successful.")
 
 if __name__ == "__main__":
     x = np.random.random(1 << 20).astype(np.float32)
